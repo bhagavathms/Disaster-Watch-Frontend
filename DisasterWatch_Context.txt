@@ -1,0 +1,549 @@
+================================================================================
+  DISASTERWATCH — FULL PROJECT CONTEXT
+  For AI assistant onboarding. Read this entire file before making any changes.
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. WHAT THIS PROJECT IS
+────────────────────────────────────────────────────────────────────────────────
+
+DisasterWatch is a full-stack real-time disaster monitoring dashboard.
+
+It ingests, stores, and visualises global disaster events across four types:
+  - Earthquake  (source: USGS)
+  - Fire        (source: NASA FIRMS MODIS + VIIRS)
+  - Flood       (source: USGS flood data)
+  - Storm       (source: OpenWeather)
+
+Scale: ~456,000+ historical events (1980–2026) stored in PostgreSQL.
+       ~500 rolling live events stored in MongoDB (8-hour TTL window).
+
+The project has two repos, both on the Desktop:
+  Frontend:  Disaster-Watch-Frontend/   (React + Vite)
+  Backend:   Disaster-Watch-Backend/    (FastAPI, Python)
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. BACKEND ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+Entry point: services/query-api/api.py
+Run command: uvicorn api:app --host 127.0.0.1 --port 8000 --reload
+API docs:    http://127.0.0.1:8000/docs
+
+--- Two databases ---
+
+PostgreSQL (disaster_dw)
+  - Star schema: fact_disaster_events + dim_event_type + dim_location + dim_time
+  - Holds ALL 456k+ historical events
+  - Used for: map rendering, search/filter, analytics aggregations
+  - Client: services/query-api/postgres_client.py
+
+MongoDB (disaster_db / disaster_events collection)
+  - Holds individual processed event documents
+  - Used for: SSE live stream, recent events, geospatial bounding-box queries
+  - Also has a separate "live_events" collection (8-hour TTL) for live simulation
+  - Client: services/query-api/mongo_client.py
+
+--- Data pipeline (backend services) ---
+
+  generate_data.py / transform-service/
+    → Reads raw data from adapters (USGS, NASA FIRMS, OpenWeather)
+    → Normalises into standard event schema
+
+  etl-service/
+    → Extracts, transforms, loads historical data into PostgreSQL + MongoDB
+
+  kafka-producer / kafka-consumer
+    → Kafka pipeline for streaming event ingestion
+
+  realtime-service/event_streamer.py
+    → Simulation: reads local JSON files, inserts into MongoDB one-by-one
+    → Controlled via POST /stream/start?delay=0.5
+
+  realtime-service/live_generator.py
+    → Procedural live event generator (no files)
+    → Inserts into MongoDB "live_events" collection (TTL: 8 hours)
+    → Rate: ~1 event per 30s → ~960 events visible at any time
+    → Controlled via POST /live/start?rate=30
+
+--- Backend routers (all under services/query-api/routers/) ---
+
+map.py        → GET /events/map
+events.py     → GET /events/recent, GET /events/search, GET /events/by-location
+analytics.py  → GET /analytics/event-counts, /analytics/monthly-trends, /analytics/locations/top
+realtime.py   → GET /stream/events (SSE), POST /stream/start|stop, GET /stream/status
+live.py       → GET /live/snapshot, GET /live/stream (SSE), POST /live/start|stop, GET /live/status
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. COMPLETE API REFERENCE
+────────────────────────────────────────────────────────────────────────────────
+
+All endpoints: base URL = http://127.0.0.1:8000
+
+--- MAP ENDPOINT (PostgreSQL) ---
+
+GET /events/map
+  Params: min_lat, max_lat, min_lon, max_lon (bounding box), zoom (int 2-20),
+          start_date (YYYY-MM-DD), end_date (YYYY-MM-DD)
+  Logic:
+    zoom ≤ 9  → "clustered" mode: H3 hexagonal grid clusters
+    zoom ≥ 10 → "events" mode: raw individual events (max 1000)
+  Response:
+    { "mode": "clustered"|"events", "total_count": N, "data": [...] }
+  Clustered row: { lat, lng, event_type, count }
+  Event row: { event_id, event_type, severity_level, latitude, longitude,
+               event_time, processed_at, source, country, place, ... }
+  Notes:
+    - H3 resolution by zoom: ≤3→res2, 4-5→res3, 6-7→res4, 8-9→res5
+    - MIN_COUNT thresholds: zoom2→10000, zoom3→300, zoom4→80, zoom5→30
+    - MAX_PER_TYPE caps: zoom2-3→80, zoom4→70, zoom5→60, zoom6-7→80-100, zoom8+→none
+    - Viewport padding: frontend adds 35% on each side before sending bbox
+
+--- SEARCH ENDPOINT (PostgreSQL) ---
+
+GET /events/search
+  Params:
+    type          repeated param: ?type=earthquake&type=fire (multi-value)
+    severity      frontend label: low|moderate|high|extreme
+    severity_level DB label:      LOW|MEDIUM|HIGH|CRITICAL
+    min_severity  DB label:       LOW|MEDIUM|HIGH|CRITICAL
+    country       partial match (ILIKE)
+    lat, lng      proximity centre
+    proximity_km  radius in km (default 500)
+    start_date, end_date  YYYY-MM-DD
+    limit         1–10000 (default 20)
+    offset        pagination offset (default 0)
+  Response: { "events": [...], "total": N }
+  Note: severity filter may not be applied server-side yet; frontend does
+        client-side severity filtering as a fallback.
+
+--- ANALYTICS ENDPOINTS (PostgreSQL) ---
+
+GET /analytics/event-counts
+  Params: none (no filter support — returns GLOBAL counts)
+  Response: { "total_events": N, "data": [{ "event_type": "fire", "count": N }, ...] }
+  IMPORTANT: This endpoint does NOT support country/date/type filters.
+             Do NOT use it when filters are active — use /events/search total instead.
+
+GET /analytics/monthly-trends
+  Params: event_type (single), year, start_date, end_date, country
+  Response: { "filters": {}, "data": [{ "year": 2020, "month": 3, "count": N }, ...] }
+  Note: DOES support date range and country filters (these are wired through).
+
+GET /analytics/locations/top
+  Params: limit (1-100), event_type
+  Response: { "data": [{ "country": "Indonesia", "region": "Asia-Pacific", "count": N }] }
+
+--- MONGODB EVENT ENDPOINTS ---
+
+GET /events/recent
+  Params: limit (1-100), event_type
+  Response: { "count": N, "data": [...] }
+
+GET /events/by-location
+  Params: min_lat, max_lat, min_lon, max_lon, limit (max 500)
+  Response: { "bounding_box": {...}, "count": N, "data": [...] }
+
+--- REALTIME STREAM (SSE from MongoDB polling) ---
+
+GET /stream/events          SSE stream — historical simulation events
+POST /stream/start?delay=N  Start event_streamer.py (reads JSON files, inserts to MongoDB)
+POST /stream/stop
+GET /stream/status
+
+--- LIVE FEED (SSE from live_generator) ---
+
+GET /live/snapshot          All active live events (≤960, 8h TTL window)
+                            Response: { "count": N, "events": [...] }
+GET /live/stream            SSE stream — new live events as generated
+                            Frames: { "type": "connected" } or { "type": "event", "data": {...} }
+POST /live/start?rate=30    Start live_generator (rate = seconds between events)
+POST /live/stop
+GET /live/status            { "generator_running": bool, "pid": N }
+
+--- HEALTH ---
+
+GET /health   { "status": "ok"|"degraded", "mongodb": {...}, "postgresql": {...} }
+
+--- STANDARD EVENT SHAPE (all endpoints) ---
+
+{
+  "event_id":       "uuid-string",
+  "event_type":     "earthquake|fire|flood|storm",   ← always lowercase in frontend
+  "severity_level": "LOW|MEDIUM|HIGH|CRITICAL",       ← DB stores uppercase
+  "latitude":       35.123,
+  "longitude":      139.456,
+  "event_time":     "2024-03-15T10:30:00Z",
+  "processed_at":   "2024-03-15T10:30:01Z",
+  "source":         "USGS|NASA_FIRMS|OpenWeather",
+  "country":        "Japan",
+  "region":         "Asia-Pacific",
+
+  // Earthquake-specific (may be null)
+  "place":           "15km NE of Tokyo",
+  "depth_km":        10.5,
+  "magnitude_type":  "Mw",
+  "mmi":             6.2,
+  "felt_count":      1200,
+
+  // Fire-specific (may be null)
+  "total_frp_mw":   45.2,
+  "area_km2":       120.5,
+  "satellite":      "MODIS",
+
+  // Flood-specific (may be null)
+  "fmi":            3.4,
+  "area_km2":       80.0,
+
+  // Storm-specific (may be null)
+  "wind_kmh":       95.0,
+  "pressure_hpa":   985.0,
+  "humidity_pct":   88.0
+}
+
+--- SEVERITY MAPPING ---
+
+DB value   → Frontend label  → SEV_ORDER (0-3)
+LOW        → low             → 0
+MEDIUM     → moderate        → 1
+HIGH       → high            → 2
+CRITICAL   → extreme         → 3
+
+
+────────────────────────────────────────────────────────────────────────────────
+4. FRONTEND ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+Stack: React 18, Vite 5, react-leaflet 4, Leaflet 1.9.4, Chart.js 4 / react-chartjs-2
+
+All source files are under Disaster-Watch-Frontend/src/
+
+--- File tree ---
+
+src/
+  config.js              ← ALL shared constants + utility functions (single source of truth)
+  countries.js           ← COUNTRIES array for the query view combobox
+  main.jsx               ← App entry point, Chart.js global defaults, CSS imports
+  App.jsx                ← Root component, view routing (map/analytics/query), SSE hook
+
+  components/
+    Navbar.jsx            ← Top nav, view switcher, live connection badge
+    MapView.jsx           ← Map page (historical + live toggle)
+    FilterPanel.jsx       ← Floating filter panel overlaid on map (right side)
+    EventSidebar.jsx      ← Slide-in event detail panel (map page)
+    AnalyticsView.jsx     ← Analytics page (Chart.js charts from pre-aggregated data)
+    QueryView.jsx         ← Query page (filters + search + analytics + paginated list)
+
+  hooks/
+    useLiveEvents.js      ← SSE connection to /stream/events, rolling buffer of 500
+    useAnalytics.js       ← Fetches /analytics/* endpoints for AnalyticsView
+    useSimulation.js      ← Controls /stream/start|stop for the simulation panel
+
+  styles/
+    main.css              ← ALL styles (CSS variables, components, animations)
+
+--- Three views (tabs in Navbar) ---
+
+1. Live Map      → MapView.jsx
+2. Analytics     → AnalyticsView.jsx
+3. Query         → QueryView.jsx
+
+Both Map and Analytics are kept mounted simultaneously (display:none swap) so
+the Leaflet map doesn't re-initialise on tab switch. Query view unmounts.
+
+--- config.js exports (complete list) ---
+
+Constants:
+  API_BASE               'http://127.0.0.1:8000'
+  MAP_INITIAL_ZOOM       2
+  MAP_MIN_ZOOM           2
+  MAP_MAX_ZOOM           18
+  MAP_TILE_MAX_ZOOM      19
+  MAP_BOUNDS_PAD         0.35   (fraction of viewport prefetched beyond edges)
+  FETCH_DEBOUNCE_MS      300
+  CLUSTER_MAX_RADIUS     70     (px, leaflet.markercluster)
+  BUBBLE_SIZE_MIN        40     (px)
+  BUBBLE_SIZE_MAX        90     (px)
+  QUERY_PAGE_SIZE        50     (events per page in Query view)
+  ANALYTICS_SAMPLE_LIMIT 2000  (events fetched for client-side analytics)
+  LOCATION_PROXIMITY_KM  500
+  SSE_MAX_RECENT         500    (rolling buffer in useLiveEvents)
+  SSE_FLUSH_MS           500    (batch flush interval)
+  SSE_RETRY_MS           5000   (SSE reconnect delay)
+
+Mappings:
+  TYPE_COLORS            { earthquake: '#f97316', fire: '#ef4444', flood: '#3b82f6', storm: '#a855f7' }
+  TYPE_COLORS_ALPHA      same but rgba(x,x,x,0.75)
+  SEV_COLORS             { low: '#22c55e', moderate: '#eab308', high: '#f97316', extreme: '#ef4444' }
+  SEV_COLORS_ALPHA       same but rgba
+  SEV_RADIUS             { low: 4, moderate: 5, high: 7, extreme: 9 }   px dot radius
+  SEV_ORDER              { low: 0, moderate: 1, high: 2, extreme: 3 }
+  SEV_PCT                { low: 25, moderate: 50, high: 75, extreme: 100 }  sidebar bar width
+  DB_TO_SEV              { LOW: 'low', MEDIUM: 'moderate', HIGH: 'high', CRITICAL: 'extreme' }
+  SEV_TO_DB              { low: 'LOW', moderate: 'MEDIUM', high: 'HIGH', extreme: 'CRITICAL' }
+  CHART_COLOR_PALETTE    8-color array for doughnut/pie charts
+  TYPES                  ['earthquake', 'fire', 'flood', 'storm']
+  SEV_LEVELS             ['low', 'moderate', 'high', 'extreme']
+  MONTHS                 ['Jan', ... 'Dec']
+  REGIONS                6 named bounding boxes (Asia-Pacific, South Asia, Americas, ...)
+
+Functions:
+  normalizeSeverity(level)   DB uppercase → frontend lowercase
+  normSev                    alias for normalizeSeverity (short form used in components)
+  normalizeEvent(ev)         normalises a raw event doc (lowercases type, converts severity, parses lat/lng)
+  getRegion(lat, lon)        returns region name from REGIONS bounding boxes
+  capitalize(str)
+  formatTimestamp(iso)       → UTC string
+
+
+────────────────────────────────────────────────────────────────────────────────
+5. MAP VIEW — HOW IT WORKS
+────────────────────────────────────────────────────────────────────────────────
+
+MapView.jsx has two modes toggled by a floating pill button at the top of the map:
+
+--- HISTORICAL MODE (default) ---
+
+Component: MapDataLayer (inside react-leaflet MapContainer)
+
+On every pan/zoom (debounced 300ms):
+  1. Gets map bounding box, expands by 35% on each side (MAP_BOUNDS_PAD)
+  2. Sends GET /events/map?min_lat=...&max_lat=...&zoom=...&start_date=...&end_date=...
+  3. If response.mode === 'clustered':
+       → Renders H3 cluster bubbles as L.divIcon circles (sized by log2(count))
+       → Each bubble shows total count, colored by dominant disaster type
+       → Clicking does nothing (clusters only show tooltip)
+  4. If response.mode === 'events':
+       → Uses leaflet.markercluster (MCG) for client-side pixel-proximity clustering
+       → Individual markers are colored dots sized by severity
+       → Clicking opens EventSidebar with full event details
+  5. Updates filteredCount display in FilterPanel via onCountChange callback
+
+Stale fetch guard: fetchSeqRef prevents out-of-order responses from applying.
+Two Leaflet layers: bubblesRef (L.layerGroup for H3 clusters) + mcgRef (MCG for events).
+
+FilterPanel (right side overlay):
+  - Disaster type checkboxes (earthquake/fire/flood/storm) — filtered client-side
+  - Minimum severity dropdown — filtered client-side
+  - Date range (two date pickers + Apply button) — sent to backend
+  - Reset Filters button
+  - Event count display ("Showing 438,645 events")
+  - Live Feed Simulation controls (Delay input, Start/Stop, status)
+
+--- LIVE MODE ---
+
+Component: LiveDataLayer (replaces MapDataLayer when live toggle is on)
+FilterPanel: hidden in live mode
+
+On mount:
+  1. Fetches GET /live/snapshot → places all current live events as pulsing dots
+  2. Opens EventSource to GET /live/stream
+  3. Each incoming { type: 'event', data: {...} } frame adds a new marker
+  4. Deduplication by event_id (seenRef Set)
+  5. Markers use same color scheme as historical but with pulse CSS animation
+
+On unmount (toggle back to historical):
+  1. EventSource.close()
+  2. map.removeLayer(layerRef.current) — all live markers gone
+  3. seenRef.clear()
+
+No clustering in live mode (max ~960 events, browser handles it fine).
+
+
+────────────────────────────────────────────────────────────────────────────────
+6. ANALYTICS VIEW — HOW IT WORKS
+────────────────────────────────────────────────────────────────────────────────
+
+AnalyticsView.jsx uses useAnalytics hook which on mount fetches:
+  - GET /analytics/event-counts
+  - GET /analytics/locations/top?limit=30
+  - GET /analytics/monthly-trends?event_type=earthquake  (×4, one per type)
+
+All in parallel via Promise.all.
+
+Displays four Chart.js charts:
+  1. Bar chart — event counts by type
+  2. Stacked bar — severity distribution per type (uses live SSE events as fallback)
+  3. Line chart — monthly trends per type (12 months, current year by default)
+  4. Doughnut — events by region/continent
+
+Also shows 4 stat cards: Total Events, Most Active Region, Peak Month, Dominant Type.
+
+Note: This view uses the global pre-aggregated analytics endpoints — no country/date
+filter support here. For filtered analytics, use the Query view.
+
+
+────────────────────────────────────────────────────────────────────────────────
+7. QUERY VIEW — HOW IT WORKS
+────────────────────────────────────────────────────────────────────────────────
+
+QueryView.jsx — filter panel on left, results on right.
+
+Left sidebar filters:
+  - Disaster type checkboxes
+  - Minimum severity dropdown
+  - Country (searchable combobox — 150+ countries from src/countries.js)
+  - Location lat/lng (for proximity search, radius fixed at 500km)
+  - Date range (from/to)
+  - Group by (Month / Year) for the chart
+
+On Search click, three parallel requests fire:
+  1. Analytics sample: GET /events/search?[all filters]&limit=2000&offset=0
+     → Used for: severity distribution bar, continent table, fallback chart data
+  2. Page 0: GET /events/search?[all filters]&limit=50&offset=0
+     → Used for: event list (first page), and page0.total = authoritative total count
+  3. Monthly trends: GET /analytics/monthly-trends?[date+country+type filters]
+     → One request per enabled disaster type, combined client-side for the chart
+
+After fetches resolve:
+  - accurateTotal = page0.total  (single source of truth for all count cards)
+  - scale = accurateTotal / sampleSummary.total
+  - byType, bySev, byContinent all scaled by `scale` so they sum to accurateTotal
+  - Summary cards: Total Events + 4 per-type cards + Avg Severity
+  - Severity distribution: stacked bar with scaled counts
+  - By Region table: scaled counts + avg severity per region
+  - Events by Month/Year: bar chart from analytics/monthly-trends
+  - Event list: paginated, 50/page, server-side (fetches new page on navigation)
+
+IMPORTANT KNOWN ISSUE:
+  /analytics/event-counts does NOT support country/date/type filters.
+  Do NOT use it for per-type breakdown when filters are active.
+  Always derive per-type counts from the search sample scaled to page0.total.
+
+Severity filter:
+  Frontend sends: severity=extreme AND severity_level=CRITICAL AND min_severity=CRITICAL
+  (all three param names sent as a workaround because backend param name is uncertain)
+  Client-side severity filter also applied after normalisation as a safety net.
+
+Event list rows:
+  Shows type dot, type name, country/location, date, severity
+  Click to expand inline → shows all event fields including type-specific ones
+  (depth for earthquakes, FRP for fires, FMI for floods, wind for storms)
+
+
+────────────────────────────────────────────────────────────────────────────────
+8. KEY DESIGN DECISIONS & CONSTRAINTS
+────────────────────────────────────────────────────────────────────────────────
+
+1. MAP PERFORMANCE
+   The map never downloads bulk events. At low zoom, the backend returns H3
+   cluster aggregates (a few hundred rows). At zoom ≥ 10, individual events
+   are fetched but bounded at 1000. The frontend adds 35% viewport padding so
+   clusters don't pop in on small pans.
+
+2. NO HEATMAP
+   Heatmaps were deliberately removed. The cluster bubble approach was chosen
+   because heatmaps caused confusion about event locations/density.
+
+3. CLUSTER CONSISTENCY ACROSS ZOOM LEVELS
+   Backend uses H3 hexagonal grid (not square grid) to avoid visual grid patterns.
+   MIN_COUNT thresholds filter out sparse hexagons at low zoom.
+   MAX_PER_TYPE caps prevent flooding the viewport with too many clusters.
+   These caps were carefully tuned to balance visibility and performance.
+
+4. ANALYTICS SAMPLE vs ACCURATE TOTAL
+   With 456k+ events, fetching all for client-side analytics would crash the browser.
+   Solution: fetch 2000 events as a representative sample for distributions,
+   and use page0.total (from the search endpoint) as the authoritative total.
+   All sample-derived counts are scaled by (accurateTotal / sampleSize) for consistency.
+
+5. ANALYTICS ENDPOINT LIMITATION
+   /analytics/event-counts has NO filter support. It always returns global totals.
+   This is a known limitation. Do not call it when country/date filters are active.
+   The monthly-trends endpoint DOES support date range and country filters.
+
+6. SEVERITY NORMALIZATION
+   DB stores: LOW, MEDIUM, HIGH, CRITICAL (uppercase)
+   Frontend uses: low, moderate, high, extreme (lowercase, different names)
+   normSev() / normalizeSeverity() converts DB → frontend.
+   SEV_TO_DB converts frontend → DB for sending filter params.
+   ALL normalization goes through config.js — no local copies in components.
+
+7. LIVE FEED ARCHITECTURE
+   Two separate SSE streams exist:
+   - /stream/events: historical simulation (event_streamer.py reads JSON files)
+   - /live/stream: live generation (live_generator.py creates synthetic events)
+   The navbar live badge tracks /stream/events (historical simulation).
+   The map live mode uses /live/stream and /live/snapshot.
+
+8. CSS VARIABLES
+   All colors, spacing, border-radius, shadows, transitions use CSS variables
+   defined in :root in main.css. Components use var(--name) for theming.
+   Leaflet dark theme is overridden in main.css.
+
+9. NO HARDCODED MAGIC NUMBERS IN COMPONENTS
+   All magic numbers are in config.js. Adding a new tunable value:
+   → Add it to config.js, import it in the component.
+
+10. REACT STATE ARCHITECTURE
+    MapView: local state (filters, selectedEvent, filteredCount, isLive)
+    App: view state + SSE hook (recentEvents, connState, flashCount)
+    QueryView: complex state (summary, listTotal, pageEvents, pageIdx, groupedData)
+    No global state manager (Redux/Zustand) — component-local useState is sufficient.
+
+
+────────────────────────────────────────────────────────────────────────────────
+9. THINGS THAT ARE DELIBERATELY NOT DONE
+────────────────────────────────────────────────────────────────────────────────
+
+- No server-side severity filter reliability: client-side filter is the source of truth
+- No global state manager: intentionally avoided, component state is sufficient
+- No heatmap: removed by design
+- No clustering in live mode: live events are bounded at ~960, no need
+- No radius selector in Query view: fixed at 500km by design
+- /analytics/event-counts not called with filters: it ignores them, so we don't
+
+
+────────────────────────────────────────────────────────────────────────────────
+10. HOW TO RUN THE PROJECT
+────────────────────────────────────────────────────────────────────────────────
+
+Backend:
+  cd Disaster-Watch-Backend/services/query-api
+  uvicorn api:app --host 127.0.0.1 --port 8000 --reload
+
+Frontend:
+  cd Disaster-Watch-Frontend
+  npm run dev    → starts on http://localhost:3000
+
+To start live event simulation:
+  POST http://127.0.0.1:8000/live/start?rate=30     (1 event per 30 seconds)
+  POST http://127.0.0.1:8000/stream/start?delay=0.5 (historical simulation)
+
+To stop:
+  POST http://127.0.0.1:8000/live/stop
+  POST http://127.0.0.1:8000/stream/stop
+
+
+────────────────────────────────────────────────────────────────────────────────
+11. CSS CLASS NAMING CONVENTIONS
+────────────────────────────────────────────────────────────────────────────────
+
+.map-*         MapView layout
+.filter-*      FilterPanel
+.cluster-*     Leaflet cluster bubble markers
+.live-*        Live mode toggle + live dot markers
+.detail-*      EventSidebar
+.sidebar-*     EventSidebar inner elements
+.badge-*       Type/severity badges
+.sev-*         Severity bar in sidebar
+.field-*       Extended field rows in sidebar
+.analytics-*   AnalyticsView layout
+.chart-*       Chart cards in AnalyticsView
+.stat-*        Stat cards in AnalyticsView
+.query-*       QueryView layout
+.qs-*          Query sidebar filter elements
+.qsum-*        Query summary cards
+.qsev-*        Query severity distribution bar
+.qcont-*       Query continent/region table
+.qchart-*      Query grouped chart
+.qev-*         Query event list cards
+.qpager        Pagination controls
+.country-*     Country combobox dropdown
+.conn-*        Connection badge in Navbar
+.nav-*         Navbar elements
+.brand-*       Navbar brand/logo
+================================================================================

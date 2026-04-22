@@ -8,6 +8,9 @@
 
 window.APP = {
 
+  // Backend API base URL
+  API_BASE: 'http://127.0.0.1:8000',
+
   // Colors per disaster type
   TYPE_COLORS: {
     earthquake: '#f97316',
@@ -66,6 +69,34 @@ window.APP = {
 
   // Chart.js global defaults (applied once on boot)
   _chartDefaultsApplied: false
+};
+
+// ─────────────────────────────────────────────
+// BACKEND EVENT NORMALIZATION
+// ─────────────────────────────────────────────
+
+// Map backend severity strings (LOW/MEDIUM/HIGH/CRITICAL) to frontend keys
+window.APP.normalizeSeverity = function(level) {
+  return ({ LOW: 'low', MEDIUM: 'moderate', HIGH: 'high', CRITICAL: 'extreme' })[
+    (level || '').toUpperCase()
+  ] || 'low';
+};
+
+// Convert a backend event object into the shape the frontend expects
+window.APP.normalizeEvent = function(ev) {
+  return {
+    event_id:       ev.event_id,
+    event_type:     (ev.event_type || '').toLowerCase(),
+    severity_level: window.APP.normalizeSeverity(ev.severity_level),
+    severity_raw:   ev.severity_raw || null,
+    latitude:       parseFloat(ev.latitude),
+    longitude:      parseFloat(ev.longitude),
+    timestamp:      ev.event_time || ev.processed_at || ev.timestamp,
+    processed_at:   ev.processed_at,
+    source:         ev.source,
+    // pass through any extra fields the API might return
+    ...ev
+  };
 };
 
 // ─────────────────────────────────────────────

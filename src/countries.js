@@ -1,0 +1,17 @@
+export const COUNTRIES = [
+  'Afghanistan','Albania','Algeria','Angola','Argentina','Armenia','Australia','Austria','Azerbaijan',
+  'Bangladesh','Belarus','Belgium','Bolivia','Bosnia and Herzegovina','Brazil','Bulgaria','Burkina Faso',
+  'Cambodia','Cameroon','Canada','Chad','Chile','China','Colombia','Congo','Costa Rica','Croatia','Cuba',
+  'Czech Republic','Denmark','Dominican Republic','DR Congo','Ecuador','Egypt','El Salvador','Ethiopia',
+  'Finland','France','Georgia','Germany','Ghana','Greece','Guatemala','Guinea','Haiti','Honduras',
+  'Hungary','India','Indonesia','Iran','Iraq','Ireland','Israel','Italy','Ivory Coast','Jamaica',
+  'Japan','Jordan','Kazakhstan','Kenya','Kosovo','Kuwait','Kyrgyzstan','Laos','Lebanon','Libya',
+  'Madagascar','Malawi','Malaysia','Mali','Mexico','Moldova','Mongolia','Morocco','Mozambique','Myanmar',
+  'Nepal','Netherlands','New Zealand','Nicaragua','Niger','Nigeria','North Korea','Norway','Oman',
+  'Pakistan','Panama','Papua New Guinea','Paraguay','Peru','Philippines','Poland','Portugal','Romania',
+  'Russia','Rwanda','Saudi Arabia','Senegal','Serbia','Sierra Leone','Somalia','South Africa',
+  'South Korea','South Sudan','Spain','Sri Lanka','Sudan','Sweden','Switzerland','Syria','Taiwan',
+  'Tajikistan','Tanzania','Thailand','Togo','Tunisia','Turkey','Turkmenistan','Uganda','Ukraine',
+  'United Arab Emirates','United Kingdom','United States','Uruguay','Uzbekistan','Venezuela',
+  'Vietnam','Yemen','Zambia','Zimbabwe',
+];
